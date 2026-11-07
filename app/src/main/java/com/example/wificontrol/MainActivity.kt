@@ -186,7 +186,7 @@ class MainActivity : Activity() {
             }, matchWidth().apply { bottomMargin = dp(7) })
         }
 
-        text("WiFi Control 1.1", 25f, true)
+        text("WiFi Control 1.2", 25f, true)
         text("סריקת רשתות, חיבור וניהול Wi-Fi מתוך האפליקציה.", 15f)
         status = text("בודק מצב Wi-Fi…", 15f, true)
 
