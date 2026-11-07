@@ -318,7 +318,7 @@ class MainActivity : Activity() {
             when (kind) {
                 "wpa2" -> builder.setWpa2Passphrase(pass)
                 "wpa3" -> {
-                    if (Build.VERSION.SDK_INT < 30) {
+                    if (Build.VERSION.SDK_INT < 29) {
                         setStatus("חיבור WPA3 ללא Root דורש Android 11 ומעלה.")
                         return
                     }
