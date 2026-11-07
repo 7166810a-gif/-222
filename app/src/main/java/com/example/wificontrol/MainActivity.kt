@@ -156,7 +156,6 @@ class MainActivity : Activity() {
 
     private fun hasScanPermissions(): Boolean {
         val needed = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
-        if (Build.VERSION.SDK_INT >= 33) needed += Manifest.permission.NEARBY_WIFI_DEVICES
         val missing = needed.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isEmpty()) return true
         requestPermissions(missing.toTypedArray(), REQUEST_PERMISSIONS)
@@ -178,8 +177,7 @@ class MainActivity : Activity() {
 
     private fun hasAllPermissions(): Boolean {
         if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) return false
-        return Build.VERSION.SDK_INT < 33 ||
-            checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED
+        return true
     }
 
     @Suppress("DEPRECATION")
@@ -319,7 +317,7 @@ class MainActivity : Activity() {
                 "wpa2" -> builder.setWpa2Passphrase(pass)
                 "wpa3" -> {
                     if (Build.VERSION.SDK_INT < 29) {
-                        setStatus("חיבור WPA3 ללא Root דורש Android 11 ומעלה.")
+                        setStatus("חיבור WPA3 ללא Root דורש Android 10 ומעלה.")
                         return
                     }
                     builder.setWpa3Passphrase(pass)
