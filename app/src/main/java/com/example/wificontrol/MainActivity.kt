@@ -48,6 +48,7 @@ class MainActivity : Activity() {
     private val shizukuArgs by lazy {
         Shizuku.UserServiceArgs(ComponentName(this, WifiShellUserService::class.java))
             .daemon(false)
+            .processNameSuffix("wifi")
             .tag("wifi-control-shell")
             .version(2)
     }
