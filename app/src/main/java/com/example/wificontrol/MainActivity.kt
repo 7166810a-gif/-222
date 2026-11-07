@@ -390,7 +390,7 @@ class MainActivity : Activity() {
     private fun toggleWifiWithFallback() {
         val targetEnabled = !isWifiEnabled()
         val targetWord = if (targetEnabled) "enabled" else "disabled"
-        setStatus("מנסה " + if (targetEnabled) "להפעיל" else "לכבות" + " Wi-Fi…")
+        setStatus("מנסה " + (if (targetEnabled) "להפעיל" else "לכבות") + " Wi-Fi…")
         Thread {
             var success = false
             var detail = ""
