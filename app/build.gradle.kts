@@ -9,6 +9,10 @@ dependencies {
 }
 
 android {
+    buildFeatures {
+        aidl = true
+    }
+
     namespace = "com.example.wificontrol"
     compileSdk = 35
 
