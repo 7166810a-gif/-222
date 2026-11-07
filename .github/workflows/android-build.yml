@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: android-apk-${{ github.ref }}
+  group: android-apk-v2-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
