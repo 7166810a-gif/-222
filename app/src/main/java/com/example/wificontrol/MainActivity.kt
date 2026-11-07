@@ -3,17 +3,22 @@ package com.example.wificontrol
 import android.Manifest
 import android.app.Activity
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.net.wifi.ScanResult
 import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSuggestion
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
+import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.widget.ArrayAdapter
@@ -24,6 +29,7 @@ import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import rikka.shizuku.Shizuku
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
@@ -36,12 +42,63 @@ class MainActivity : Activity() {
     private lateinit var selectedLabel: TextView
     private var selected: ScanResult? = null
     private var receiverRegistered = false
+    @Volatile private var shizukuShell: IWifiShellService? = null
+    @Volatile private var shizukuBindRequested = false
+
+    private val shizukuArgs by lazy {
+        Shizuku.UserServiceArgs(ComponentName(this, WifiShellUserService::class.java))
+            .daemon(false)
+            .tag("wifi-control-shell")
+            .version(2)
+    }
+
+    private val shizukuConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            shizukuShell = service?.let { IWifiShellService.Stub.asInterface(it) }
+            shizukuBindRequested = false
+            setStatus(
+                if (shizukuShell != null) "Shizuku מחובר. אפשר להפעיל Wi-Fi או להתחבר בלי Root."
+                else "Shizuku התחבר אך שירות הפקודות לא זמין."
+            )
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            shizukuShell = null
+            shizukuBindRequested = false
+            setStatus("חיבור Shizuku נותק. אפשר לנסות להתחבר מחדש.")
+        }
+    }
+
+    private val shizukuBinderListener = Shizuku.OnBinderReceivedListener {
+        runOnUiThread {
+            try {
+                if (!Shizuku.isPreV11() &&
+                    Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+                ) {
+                    bindShizukuService()
+                } else {
+                    setStatus("Shizuku זוהה. לחץ על ״חבר Shizuku / ADB״ ואשר הרשאה.")
+                }
+            } catch (e: Exception) {
+                setStatus("Shizuku זוהה אך אינו מוכן: " + (e.message ?: e.javaClass.simpleName))
+            }
+        }
+    }
+
+    private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+        if (requestCode == REQUEST_SHIZUKU) {
+            if (grantResult == PackageManager.PERMISSION_GRANTED) {
+                setStatus("הרשאת Shizuku אושרה. מחבר שירות…")
+                bindShizukuService()
+            } else {
+                setStatus("הרשאת Shizuku נדחתה. לא בוצע שינוי ב-Wi-Fi.")
+            }
+        }
+    }
 
     private val scanReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == WifiManager.SCAN_RESULTS_AVAILABLE_ACTION) {
-                showResults()
-            }
+            if (intent?.action == WifiManager.SCAN_RESULTS_AVAILABLE_ACTION) showResults()
         }
     }
 
@@ -49,6 +106,8 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         createUi()
+        Shizuku.addBinderReceivedListenerSticky(shizukuBinderListener)
+        Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
         updateStatus()
     }
 
@@ -65,6 +124,15 @@ class MainActivity : Activity() {
             receiverRegistered = true
         }
         updateStatus()
+        if (Shizuku.pingBinder() && shizukuShell == null && !shizukuBindRequested) {
+            try {
+                if (!Shizuku.isPreV11() &&
+                    Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+                ) bindShizukuService()
+            } catch (_: Exception) {
+                // The explicit Shizuku button displays the actionable error.
+            }
+        }
     }
 
     override fun onPause() {
@@ -73,6 +141,21 @@ class MainActivity : Activity() {
             receiverRegistered = false
         }
         super.onPause()
+    }
+
+    override fun onDestroy() {
+        Shizuku.removeBinderReceivedListener(shizukuBinderListener)
+        Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener)
+        if (shizukuShell != null || shizukuBindRequested) {
+            try {
+                if (Shizuku.pingBinder()) Shizuku.unbindUserService(shizukuArgs, shizukuConnection, true)
+            } catch (_: Exception) {
+                // The Shizuku process may have stopped already.
+            }
+        }
+        shizukuShell = null
+        shizukuBindRequested = false
+        super.onDestroy()
     }
 
     private fun createUi() {
@@ -102,14 +185,19 @@ class MainActivity : Activity() {
             }, matchWidth().apply { bottomMargin = dp(7) })
         }
 
-        text("סורק ומנהל Wi-Fi", 25f, true)
-        text("סריקת רשתות, בחירת רשת וניסיון התחברות מתוך האפליקציה.", 15f)
+        text("WiFi Control 1.1", 25f, true)
+        text("סריקת רשתות, חיבור וניהול Wi-Fi מתוך האפליקציה.", 15f)
         status = text("בודק מצב Wi-Fi…", 15f, true)
 
         button("סרוק רשתות Wi-Fi") {
             if (hasScanPermissions()) startScan()
         }
-        button("הפעל / כבה Wi-Fi (ניסיון Root)") { toggleWifiWithRoot() }
+        button("הפעל / כבה Wi-Fi") { toggleWifiWithFallback() }
+        button("חבר Shizuku / ADB (מומלץ ללא Root)") { prepareShizukuAccess() }
+        button("הורד את Shizuku") {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://shizuku.rikka.app/download/")))
+        }
+        button("פתח לוח חיבור Android (חלופה)") { openConnectivityPanel() }
 
         text("התחברות לרשת שנבחרה", 19f, true)
         selectedLabel = text("לא נבחרה רשת", 14f)
@@ -141,8 +229,8 @@ class MainActivity : Activity() {
         }
         body.addView(networkList, matchWidth())
         text(
-            "הערה: הסריקה כפופה להרשאות, לשירותי המיקום ולהגבלות Android. " +
-                "ללא Root, המערכת מחליטה אם ומתי להתחבר להצעת רשת.",
+            "ללא Root אפשר להשתמש ב-Shizuku עם הרשאת ADB מפורשת. " +
+                "בלי Root או Shizuku, Android אינה מאפשרת לאפליקציה רגילה להדליק או לכבות Wi-Fi בשקט.",
             12f
         )
     }
@@ -155,11 +243,11 @@ class MainActivity : Activity() {
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
 
     private fun hasScanPermissions(): Boolean {
-        val needed = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
-        val missing = needed.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        val missing = listOf(Manifest.permission.ACCESS_FINE_LOCATION)
+            .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isEmpty()) return true
         requestPermissions(missing.toTypedArray(), REQUEST_PERMISSIONS)
-        setStatus("נדרשת הרשאת מיקום ומכשירים בקרבת מקום כדי לסרוק רשתות.")
+        setStatus("נדרשת הרשאת מיקום כדי לסרוק רשתות Wi-Fi.")
         return false
     }
 
@@ -171,19 +259,23 @@ class MainActivity : Activity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_PERMISSIONS) {
             if (hasAllPermissions()) startScan()
-            else setStatus("ההרשאות לא אושרו. לא ניתן לסרוק רשתות.")
+            else setStatus("הרשאת המיקום לא אושרה. לא ניתן לסרוק רשתות.")
         }
     }
 
-    private fun hasAllPermissions(): Boolean {
-        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) return false
-        return true
-    }
+    private fun hasAllPermissions(): Boolean =
+        checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
 
     @Suppress("DEPRECATION")
     private fun updateStatus() {
         val enabled = try { wifi.isWifiEnabled } catch (_: Exception) { false }
-        status.text = if (enabled) "Wi-Fi פעיל" else "Wi-Fi כבוי"
+        val connection = try {
+            if (Build.VERSION.SDK_INT >= 23) wifi.connectionInfo?.ssid else null
+        } catch (_: Exception) { null }
+        status.text = if (enabled) {
+            if (!connection.isNullOrBlank() && connection != "<unknown ssid>") "Wi-Fi פעיל • $connection"
+            else "Wi-Fi פעיל • לא מחובר לרשת"
+        } else "Wi-Fi כבוי"
     }
 
     private fun setStatus(message: String) {
@@ -194,13 +286,13 @@ class MainActivity : Activity() {
         if (!hasScanPermissions()) return
         val location = getSystemService(Context.LOCATION_SERVICE) as LocationManager
         if (Build.VERSION.SDK_INT >= 28 && !location.isLocationEnabled) {
-            setStatus("כדי לקבל תוצאות סריקה, יש להפעיל שירותי מיקום במכשיר.")
+            setStatus("יש להפעיל שירותי מיקום במכשיר כדי לקבל תוצאות סריקה.")
             return
         }
         try {
             if (wifi.startScan()) setStatus("הסריקה נשלחה למערכת. ממתין לתוצאות…")
             else {
-                setStatus("המערכת הגבילה סריקה חדשה. מציג תוצאות אחרונות.")
+                setStatus("Android הגביל סריקה חדשה. מציג תוצאות אחרונות.")
                 showResults()
             }
         } catch (e: Exception) {
@@ -222,7 +314,7 @@ class MainActivity : Activity() {
             networkList.removeAllViews()
             if (results.isEmpty()) {
                 networkList.addView(TextView(this).apply {
-                    text = "לא נמצאו רשתות. בדוק ש-Wi-Fi פעיל ונסה שוב."
+                    text = "לא נמצאו רשתות. בדוק Wi-Fi, הרשאות ושירותי מיקום."
                     textSize = 14f
                 })
                 return@runOnUiThread
@@ -257,17 +349,87 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun toggleWifiWithRoot() {
-        val enable = try { !wifi.isWifiEnabled } catch (_: Exception) { true }
-        setStatus("מנסה לשנות מצב Wi-Fi באמצעות su…")
+    private fun prepareShizukuAccess() {
+        try {
+            if (!Shizuku.pingBinder()) {
+                setStatus("Shizuku אינו פעיל. התקן את Shizuku, הפעל אותו ואשר Wireless debugging או Root.")
+                return
+            }
+            if (Shizuku.isPreV11()) {
+                setStatus("גרסת Shizuku ישנה מדי. עדכן את Shizuku לגרסה עדכנית.")
+                return
+            }
+            if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
+                bindShizukuService()
+            } else {
+                setStatus("ממתין לאישור הרשאת Shizuku…")
+                Shizuku.requestPermission(REQUEST_SHIZUKU)
+            }
+        } catch (e: Exception) {
+            setStatus("לא ניתן להתחבר ל-Shizuku: " + (e.message ?: e.javaClass.simpleName))
+        }
+    }
+
+    private fun bindShizukuService() {
+        if (shizukuShell != null || shizukuBindRequested) return
+        if (!Shizuku.pingBinder()) {
+            setStatus("Shizuku לא פעיל. פתח את Shizuku והפעל את השירות.")
+            return
+        }
+        shizukuBindRequested = true
+        try {
+            Shizuku.bindUserService(shizukuArgs, shizukuConnection)
+            setStatus("מבקש מ-Shizuku להפעיל שירות Wi-Fi…")
+        } catch (e: Exception) {
+            shizukuBindRequested = false
+            setStatus("הפעלת שירות Shizuku נכשלה: " + (e.message ?: e.javaClass.simpleName))
+        }
+    }
+
+    private fun toggleWifiWithFallback() {
+        val targetEnabled = !isWifiEnabled()
+        val targetWord = if (targetEnabled) "enabled" else "disabled"
+        setStatus("מנסה " + if (targetEnabled) "להפעיל" else "לכבות" + " Wi-Fi…")
         Thread {
-            val result = runRoot("cmd wifi set-wifi-enabled " + if (enable) "enabled" else "disabled")
-                .let { if (it.first) it else runRoot("svc wifi " + if (enable) "enable" else "disable") }
+            var success = false
+            var detail = ""
+            val rootCommands = listOf(
+                listOf("/system/bin/cmd", "wifi", "set-wifi-enabled", targetWord),
+                listOf("/system/bin/svc", "wifi", if (targetEnabled) "enable" else "disable")
+            )
+            for (args in rootCommands) {
+                val result = runRootCommand(args)
+                detail = result.second
+                if (result.first == 0 && waitForWifiState(targetEnabled)) {
+                    success = true
+                    break
+                }
+            }
+
+            if (!success) {
+                val remote = shizukuShell
+                if (remote != null) {
+                    try {
+                        val result = parseRemote(remote.setWifiEnabled(targetEnabled))
+                        detail = result.second
+                        if (result.first == 0 && waitForWifiState(targetEnabled)) success = true
+                    } catch (e: Exception) {
+                        detail = e.message ?: e.javaClass.simpleName
+                    }
+                }
+            }
+
             runOnUiThread {
-                if (result.first) {
-                    setStatus("פקודת שינוי מצב Wi-Fi התקבלה. בודק מצב…")
-                    status.postDelayed({ updateStatus() }, 1800)
-                } else setStatus("Root לא זמין או שהפקודה אינה נתמכת. " + result.second)
+                if (success) {
+                    setStatus(if (targetEnabled) "Wi-Fi הופעל ואומת." else "Wi-Fi כובה ואומת.")
+                } else {
+                    val accessHint = if (shizukuShell == null) {
+                        " אין Root מאושר או חיבור Shizuku. לחץ על ״חבר Shizuku / ADB״ והפעל את השירות."
+                    } else {
+                        " Shizuku מחובר אך המכשיר חסם את פקודת Wi-Fi."
+                    }
+                    setStatus("הפעולה לא הצליחה: " + detail + accessHint)
+                }
             }
         }.start()
     }
@@ -285,26 +447,42 @@ class MainActivity : Activity() {
             setStatus("הזן סיסמה לרשת המאובטחת.")
             return
         }
-        setStatus("מנסה להתחבר ל-" + ssid + " באמצעות Root…")
+        val kind = when (mode) {
+            "פתוחה" -> "open"
+            "WPA3" -> "wpa3"
+            else -> "wpa2"
+        }
+        setStatus("מנסה להתחבר ל-" + ssid + "…")
         Thread {
-            val kind = when (mode) {
-                "פתוחה" -> "open"
-                "WPA3" -> "wpa3"
-                else -> "wpa2"
+            var success = false
+            var detail = ""
+            val rootArgs = mutableListOf("/system/bin/cmd", "wifi", "connect-network", ssid, kind)
+            if (kind != "open") rootArgs.add(pass)
+            val rootResult = runRootCommand(rootArgs)
+            detail = rootResult.second
+            if (rootResult.first == 0 && waitForNetwork(ssid)) success = true
+
+            if (!success) {
+                val remote = shizukuShell
+                if (remote != null) {
+                    try {
+                        val remoteResult = parseRemote(remote.connectNetwork(ssid, kind, pass))
+                        detail = remoteResult.second
+                        if (remoteResult.first == 0 && waitForNetwork(ssid)) success = true
+                    } catch (e: Exception) {
+                        detail = e.message ?: e.javaClass.simpleName
+                    }
+                }
             }
-            var result = runRoot(
-                "cmd wifi connect-network " + quote(ssid) + " " + kind +
-                    if (kind == "open") "" else " " + quote(pass)
-            )
+
             runOnUiThread {
-                if (result.first) {
-                    setStatus("פקודת חיבור נשלחה עבור " + ssid + ". בדוק את מצב החיבור במכשיר.")
-                    Toast.makeText(this, "נשלחה בקשת חיבור", Toast.LENGTH_SHORT).show()
-                } else if (Build.VERSION.SDK_INT >= 29) {
-                    setStatus("Root לא זמין. מנסה לשלוח הצעת רשת ל-Android…")
-                    connectSuggestion(ssid, kind, pass)
-                } else {
-                    connectLegacy(ssid, kind, pass)
+                when {
+                    success -> setStatus("התחברת לרשת " + ssid + " ואומת מצב החיבור.")
+                    Build.VERSION.SDK_INT >= 29 -> {
+                        setStatus("אין הרשאת Root/Shizuku או שהחיבור נחסם. מנסה הצעת רשת רגילה… " + detail)
+                        connectSuggestion(ssid, kind, pass)
+                    }
+                    else -> connectLegacy(ssid, kind, pass)
                 }
             }
         }.start()
@@ -317,7 +495,7 @@ class MainActivity : Activity() {
                 "wpa2" -> builder.setWpa2Passphrase(pass)
                 "wpa3" -> {
                     if (Build.VERSION.SDK_INT < 29) {
-                        setStatus("חיבור WPA3 ללא Root דורש Android 10 ומעלה.")
+                        setStatus("חיבור WPA3 בהצעת רשת דורש Android 10 ומעלה.")
                         return
                     }
                     builder.setWpa3Passphrase(pass)
@@ -327,9 +505,7 @@ class MainActivity : Activity() {
             wifi.removeNetworkSuggestions(listOf(suggestion))
             val result = wifi.addNetworkSuggestions(listOf(suggestion))
             if (result == WifiManager.STATUS_NETWORK_SUGGESTIONS_SUCCESS) {
-                setStatus(
-                    "הצעת הרשת " + ssid + " נשלחה ל-Android. המערכת תחליט אם ומתי להתחבר; ייתכן שתידרש הסכמה."
-                )
+                setStatus("הצעת הרשת נשלחה ל-Android. המערכת תחליט אם ומתי להתחבר וייתכן שתבקש אישור.")
             } else setStatus("Android דחה את הצעת הרשת. קוד שגיאה: " + result)
         } catch (e: Exception) {
             setStatus("לא ניתן להוסיף הצעת רשת: " + (e.message ?: e.javaClass.simpleName))
@@ -357,25 +533,73 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun quote(value: String) = "'" + value.replace("'", "'\\''") + "'"
-
-    private fun runRoot(command: String): Pair<Boolean, String> {
-        return try {
-            val process = ProcessBuilder("su", "-c", command).redirectErrorStream(true).start()
-            val finished = process.waitFor(12, TimeUnit.SECONDS)
-            if (!finished) {
-                process.destroyForcibly()
-                false to "הפקודה חרגה ממגבלת הזמן."
+    private fun openConnectivityPanel() {
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                startActivity(Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY))
             } else {
-                val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
-                (process.exitValue() == 0) to output
+                startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
             }
         } catch (e: Exception) {
-            false to (e.message ?: "su אינו זמין")
+            setStatus("לא ניתן לפתוח את לוח הרשת: " + (e.message ?: e.javaClass.simpleName))
         }
+    }
+
+    private fun isWifiEnabled(): Boolean =
+        try { wifi.isWifiEnabled } catch (_: Exception) { false }
+
+    private fun waitForWifiState(expected: Boolean): Boolean {
+        repeat(20) {
+            if (isWifiEnabled() == expected) return true
+            Thread.sleep(400)
+        }
+        return false
+    }
+
+    @Suppress("DEPRECATION")
+    private fun waitForNetwork(ssid: String): Boolean {
+        repeat(30) {
+            try {
+                val info = wifi.connectionInfo
+                val actual = info?.ssid?.removeSurrounding("\"")
+                if (info?.supplicantState == android.net.wifi.SupplicantState.COMPLETED && actual == ssid) {
+                    return true
+                }
+            } catch (_: Exception) {
+                // Keep polling; connection information may not be available yet.
+            }
+            Thread.sleep(500)
+        }
+        return false
+    }
+
+    private fun runRootCommand(args: List<String>): Pair<Int, String> {
+        return try {
+            val command = args.joinToString(" ") { shellQuote(it) }
+            val process = ProcessBuilder("su", "-c", command).redirectErrorStream(true).start()
+            val finished = process.waitFor(30, TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                124 to "Root command timed out or was not approved."
+            } else {
+                val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
+                process.exitValue() to output
+            }
+        } catch (e: Exception) {
+            1 to (e.message ?: e.javaClass.simpleName)
+        }
+    }
+
+    private fun shellQuote(value: String): String =
+        "'" + value.replace("'", "'\\''") + "'"
+
+    private fun parseRemote(raw: String): Pair<Int, String> {
+        val firstLine = raw.substringBefore('\n')
+        return (firstLine.toIntOrNull() ?: 1) to raw.substringAfter('\n', "").trim()
     }
 
     companion object {
         private const val REQUEST_PERMISSIONS = 4021
+        private const val REQUEST_SHIZUKU = 4022
     }
 }
